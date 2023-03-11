@@ -30,6 +30,8 @@ use Illuminate\Support\Facades\File;
 use Seat\Eveapi\Models\Sde\MapDenormalize;
 use Seat\Services\Helpers\AnalyticsContainer;
 use Seat\Services\Jobs\Analytics;
+use Seat\Services\Settings\Seat;
+use GuzzleHttp\Exception\ConnectException;
 
 /**
  * Class Sde.
@@ -145,28 +147,11 @@ class Sde extends Command
             }
         }
 
-        // add extra tables registered on behalf providers
-        $extra_tables = config('seat.sde.tables', []);
-        //filter duplicates
-        $this->json->tables = array_unique(array_merge($this->json->tables, $extra_tables));
-        sort($this->json->tables, SORT_STRING);
-
-        //get currently installed tables
-        // after the update introducing this change or a new install, this will be null. To ensure it's properly set, we assume no sde is installed
-        $current_tables = setting('installed_sde_tables', true) ?? [];
-
-        // Avoid an existing SDE to be accidentally installed again
-        // except if there is a newer version
-        // except if the user explicitly ask for it,
-        // except if new tables are required
-        $requires_update =
-            $this->json->version !== setting('installed_sde', true) ||
-            $this->option('force') == true ||
-            array_diff($this->json->tables, $current_tables) !== [];
-
         // Avoid an existing SDE to be accidentally installed again
         // except if the user explicitly ask for it
-        if (! $requires_update) {
+        if ($this->json->version == Seat::get('installed_sde') &&
+            $this->option('force') == false
+        ) {
 
             $this->warn('You are already running the latest SDE version.');
             $this->warn('If you want to install it again, run this command with --force argument.');
@@ -186,6 +171,12 @@ class Sde extends Command
                 return;
             }
         }
+
+        // add extra tables registered on behalf providers
+        $extra_tables = config('seat.sde.tables', []);
+
+        $this->json->tables = array_unique(array_merge($this->json->tables, $extra_tables));
+        sort($this->json->tables, SORT_STRING);
 
         // Show a final confirmation with some info on what
         // we are going to be doing.
@@ -215,14 +206,16 @@ class Sde extends Command
         }
 
         // Download the SDE's
-        $this->getSde();
+        $download_success = $this->getSde();
 
         $this->importSde();
-
         $this->explodeMap();
 
-        setting(['installed_sde', $this->json->version], true);
-        setting(['installed_sde_tables', $this->json->tables], true);
+        if($download_success) {
+            Seat::set('installed_sde', $this->json->version);
+        } else {
+            $this->line('Could not update the full SDE, leaving the installed version at '.Seat::get('installed_sde'));
+        }
 
         $this->line('SDE Update Command Complete');
 
@@ -307,6 +300,7 @@ class Sde extends Command
      */
     public function getSde()
     {
+        $download_success = true;
 
         $this->line('Downloading...');
         $bar = $this->getProgressBar(count($this->json->tables));
@@ -319,21 +313,28 @@ class Sde extends Command
 
             $file_handler = fopen($destination, 'w');
 
-            $result = $this->getGuzzle()->request('GET', $url, [
-                'sink' => $file_handler, ]);
+            try {
+                $result = $this->getGuzzle()->request('GET', $url, [
+                    'sink' => $file_handler,]);
 
-            fclose($file_handler);
+                if ($result->getStatusCode() != 200) {
+                    $download_success = false;
+                    $this->warn('Unable to download ' . $url . '. The HTTP response was: ' . $result->getStatusCode() . ', Skipping this table.');
+                }
+            } catch (ConnectException $e){
+                $download_success = false;
+                $this->warn('Network error: Unable to download ' . $url . ': Skipping this table.');
+            } finally {
+                fclose($file_handler);
 
-            if ($result->getStatusCode() != 200)
-                $this->error('Unable to download ' . $url .
-                    '. The HTTP response was: ' . $result->getStatusCode());
-
-            $bar->advance();
+                $bar->advance();
+            }
         }
 
         $bar->finish();
         $this->line('');
 
+        return $download_success;
     }
 
     /**
@@ -371,6 +372,8 @@ class Sde extends Command
             if (! File::exists($archive_path)) {
 
                 $this->warn($archive_path . ' seems to be invalid. Skipping.');
+
+                $bar->advance(); //always advance the progress bar, even if we can't load the data
                 continue;
             }
 
