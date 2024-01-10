@@ -23,6 +23,7 @@
 namespace Seat\Eveapi\Jobs\Market;
 
 use Illuminate\Bus\Batchable;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Redis;
 use Seat\Eseye\Exceptions\RequestFailedException;
 use Seat\Eveapi\Exception\TemporaryEsiOutageException;
@@ -39,6 +40,9 @@ class History extends EsiBase
     use Batchable;
 
     const THE_FORGE = 10000002;
+
+    const TYPE_ID_BAN_CACHE_KEY_PREFIX = 'market_history_type_id_ban';
+    const TYPE_ID_BAN_DURATION = 60 * 60 * 24 * 30; // 1 month
 
     // override the default from AbstractJob
     public const JOB_EXECUTION_TIMEOUT = 60 * 60 * 24; // 1 day
@@ -140,7 +144,7 @@ class History extends EsiBase
      */
     public function handle()
     {
-        if ($this->batch()->cancelled()) {
+        if ($this->batch() && $this->batch()->cancelled()) {
             logger()->debug(sprintf('[Jobs][%s] Orders - Cancelling job due to relevant batch %s cancellation.', $this->job->getJobId(), $this->batch()->id));
 
             return;
@@ -153,6 +157,12 @@ class History extends EsiBase
                 logger()->debug(sprintf('[Jobs][%s] History processing -> Remaining types: %d.', $this->job->getJobId(), count($this->type_ids)));
 
                 $type_id = array_shift($this->type_ids);
+
+                // skip type if it has been banned
+                if(Cache::has(sprintf('%s.%d',self::TYPE_ID_BAN_CACHE_KEY_PREFIX, $type_id))) {
+                    logger()->debug(sprintf('[Jobs][%s] History -> SKipping %d due to it having failed previously', $this->job->getJobId(), $type_id));
+                    return false;
+                }
 
                 $this->query_string = [
                     'type_id' => $type_id,
@@ -202,6 +212,12 @@ class History extends EsiBase
                     return true;
                 } catch (RequestFailedException $e) {
                     logger()->error($e->getMessage());
+
+                    // 404: this can happen when items get removed from the market
+                    if($e->getEsiResponse()->getErrorCode() == 404) {
+                        logger()->debug(sprintf('[Jobs][%s] History -> Banning %d from being processed for 1 month due to a 404 error.', $this->job->getJobId(), $type_id));
+                        Cache::set(sprintf('%s.%d',self::TYPE_ID_BAN_CACHE_KEY_PREFIX, $type_id),true,self::TYPE_ID_BAN_DURATION);
+                    }
 
                     return true;
                 }
